@@ -1,0 +1,126 @@
+// cred_tests.nv — who the kernel says is there, and the descriptor
+// that travels with a message.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: unixsock-nv.<module>.<fn>`.
+//
+// WHERE THE CONSTANTS CAME FROM.  253 is Linux's `SCM_MAX_FD` — the
+// most descriptors one `sendmsg` may carry — and it is asserted here
+// rather than left in a comment because a batch that exceeds it fails
+// whole, so a caller building one has to know the boundary before it
+// starts.  The `LISTEN_FDS` / `LISTEN_PID` / `LISTEN_FDNAMES` names and
+// the first descriptor number 3 are systemd's `sd_listen_fds` contract,
+// which launchd and inetd predate and match.
+
+use std.test
+use std.bytes
+use std.list
+use unixsock
+use unixcred
+use unixactivate
+
+@test
+fn test_one_message_carries_at_most_the_kernel_s_limit_of_descriptors() [io]
+    test.case("Linux allows 253 per message")
+    test.assert_eq(unixcred.max_rights_per_message(), 253)
+
+@test
+fn test_credentials_come_from_the_kernel_and_not_from_the_peer() [io, net]
+    // A process connecting over AF_UNIX cannot lie about its uid: the
+    // kernel records the credentials at `connect` time.  That is the
+    // one authentication a Unix socket gives for free.
+    match unixsock.socket_pair()
+        Err(_) => test.assert(true)
+        Ok(p)  =>
+            test.case("both ends of a pair are this process, so the uid is this one")
+            match unixcred.peer_cred(p.a)
+                Err(_) => test.assert(true)
+                Ok(c)  => test.assert(c.uid >= 0)
+
+            test.case("and the convenience form agrees")
+            match unixcred.peer_is_self(p.a)
+                Err(_)   => test.assert(true)
+                Ok(mine) => test.assert(mine)
+
+            test.case("a datagram socket needs SO_PASSCRED turned on first")
+            match unixcred.set_pass_cred(p.a, true)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+
+            unixsock.close(p.a)
+            unixsock.close(p.b)
+
+@test
+fn test_a_descriptor_passed_is_a_descriptor_and_not_a_number() [io, net]
+    // `SCM_RIGHTS` duplicates the open file into the receiving process
+    // at its own number, so the two sides never agree about the
+    // integer — and an interface that passed `Int` both ways would
+    // invite exactly that mistake.
+    match unixsock.socket_pair()
+        Err(_) => test.assert(true)
+        Ok(p)  =>
+            test.case("a message with at least one byte may carry descriptors")
+            match unixcred.send_with_rights(p.a, bytes.from_str("x"), [unixsock.fd_of(p.b)])
+                Err(_) => test.assert(true)
+                Ok(n)  => test.assert_eq(n, 1)
+
+            test.case("an empty payload is refused here rather than dropped by the kernel")
+            match unixcred.send_with_rights(p.a, bytes.zeros(0), [unixsock.fd_of(p.b)])
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+            test.case("and the receiver gets its own numbers, with a truncation flag")
+            match unixcred.receive_with_rights(p.b, 4096, 4)
+                Err(_) => test.assert(true)
+                Ok(m)  =>
+                    match m
+                        None    => test.assert(true)
+                        Some(r) =>
+                            test.assert(r.rights.truncated == false)
+                            unixcred.close_rights(r.rights)
+
+            unixsock.close(p.a)
+            unixsock.close(p.b)
+
+@test
+fn test_an_inherited_listen_pid_is_not_an_activation() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  The variables are inherited
+    // across `fork` and `exec` like any others, so a helper spawned by
+    // an activated service sees `LISTEN_FDS=1` naming descriptors it
+    // does not have — and a helper that trusted the count adopts
+    // whatever fd 3 happens to be and listens on a log file.
+    test.case("this test process was not socket-activated")
+    test.assert_none(unixactivate.activation())
+
+    test.case("and clearing the variables is safe when there are none")
+    unixactivate.unset_environment()
+
+@test
+fn test_an_activation_is_addressed_by_name_and_not_by_position() [io, net]
+    // A service with a control socket and a data socket that guessed
+    // which was which by position swaps them the day somebody reorders
+    // a unit file.
+    let a = UnixActivation { first_fd: 3, count: 2, names: ["control", "data"] }
+
+    test.case("the first descriptor is the one the contract fixes")
+    test.assert_some(unixactivate.fd_at(a, 0))
+
+    test.case("and past the end is None rather than plausible arithmetic")
+    test.assert_none(unixactivate.fd_at(a, 2))
+
+    test.case("a named socket is found by its name")
+    test.assert_some(unixactivate.fd_named(a, "control"))
+
+    test.case("and a name the unit file did not use is not")
+    test.assert_none(unixactivate.fd_named(a, "telemetry"))
+
+    test.case("every activated socket comes back as a listener")
+    test.assert_eq(list.len(unixactivate.listeners(a)), 2)
+
+@test
+fn test_adopting_a_descriptor_is_an_assertion_something_can_check() [io, net]
+    test.case("this test's standard input is not a listening unix socket")
+    test.assert(unixactivate.is_unix_listener(0) == false)
+
+    test.case("nor is it a unix stream socket")
+    test.assert(unixactivate.is_unix_stream(0) == false)

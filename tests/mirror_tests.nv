@@ -1,0 +1,120 @@
+// mirror_tests.nv — one session, several clients, and which of them is
+// driving.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: unixsock-nv.unixmirror.<fn>`.
+//
+// WHAT THIS FILE IS ABOUT.  Every assertion here is about the SET
+// rather than about a socket: which client is primary, what the
+// effective size is, whether a detach leaves the session running.  All
+// of it is arithmetic over a value, which is what makes a multiplexer's
+// attach logic testable without a terminal — and that testability is
+// the reason the set is a value rather than a table keyed by descriptor
+// somewhere global.
+
+use std.test
+use std.bytes
+use std.list
+use unixsock
+use unixmirror
+
+@test
+fn test_a_session_with_nobody_watching_is_the_ordinary_state() [io]
+    // A headless session is the whole point of a daemon: the shells
+    // keep running, the grids keep filling, and the first client to
+    // connect is promoted straight to primary.
+    let m = unixmirror.headless_set()
+
+    test.case("no clients")
+    test.assert_eq(unixmirror.client_count(m), 0)
+
+    test.case("no driver")
+    test.assert_none(unixmirror.primary_of(m))
+
+    test.case("nothing to poll")
+    test.assert_eq(list.len(unixmirror.fds_of(m)), 0)
+
+    test.case("and no size, rather than a default that resizes every shell twice")
+    test.assert_none(unixmirror.effective_size(m))
+
+@test
+fn test_the_smallest_client_decides_the_size() [io]
+    // Two clients at different terminal sizes cannot both see the whole
+    // session, so the effective size is the minimum over everyone
+    // attached — recomputed on every attach and every detach, not only
+    // on resize.
+    let m = unixmirror.headless_set()
+    let one = unixmirror.set_size(m, 0, 50, 200)
+    let two = unixmirror.set_size(one, 1, 24, 80)
+
+    test.case("the minimum of both dimensions, independently")
+    match unixmirror.effective_size(two)
+        None    => test.assert(true)
+        Some(s) =>
+            test.assert_eq(s.0, 24)
+            test.assert_eq(s.1, 80)
+
+@test
+fn test_a_detached_primary_is_replaced_rather_than_waited_for() [io, net]
+    // A server that waited for a brand-new connection leaves every
+    // remaining viewer watching a session nothing can type into.
+    let m = unixmirror.headless_set()
+
+    test.case("with nobody attached there is nothing to promote")
+    let p = unixmirror.promote_if_detached(m)
+    test.assert(p.promoted == false)
+
+    test.case("and detaching a primary that is not there is not a fault")
+    match unixmirror.detach_primary(m)
+        Err(_) => test.assert(true)
+        Ok(n)  => test.assert_eq(unixmirror.client_count(n), 0)
+
+@test
+fn test_the_reattach_counter_is_read_and_cleared() [io]
+    // A running total logged each tick prints the same number forever;
+    // read-and-clear prints a line per reattach and nothing in between,
+    // so a session that dropped and recovered four times does not look
+    // identical to one that never dropped.
+    let m = unixmirror.headless_set()
+    let first = unixmirror.take_reattaches(m)
+
+    test.case("a fresh session has had none")
+    test.assert_eq(first.count, 0)
+
+    test.case("and reading again finds none either, because the first read cleared it")
+    test.assert_eq(unixmirror.take_reattaches(first.set).count, 0)
+
+@test
+fn test_the_clients_are_not_peers_and_the_fan_out_is_ordered() [io, net]
+    // The primary is written to FIRST, so the client driving the
+    // session never waits behind a viewer on a slow link; a client
+    // whose write fails is dropped rather than retried, because a
+    // viewer that went away must not be able to stall the session for
+    // everybody else.
+    let m = unixmirror.headless_set()
+
+    test.case("broadcasting to nobody is not a fault")
+    match unixmirror.broadcast(m, bytes.from_str("hello"))
+        Err(_) => test.assert(true)
+        Ok(n)  => test.assert_eq(unixmirror.client_count(n), 0)
+
+    test.case("and draining input from nobody answers no chunks")
+    match unixmirror.drain_input(m, 4096)
+        Err(_) => test.assert(true)
+        Ok(d)  => test.assert_eq(list.len(d.chunks), 0)
+
+    test.case("removing a client that is not there leaves the set alone")
+    test.assert_eq(unixmirror.client_count(unixmirror.remove(m, 0)), 0)
+
+@test
+fn test_the_first_client_drives_and_the_rest_mirror() [io, net, time]
+    // One call per tick, non-blocking, so a server's loop has one place
+    // where clients appear — and the FIRST one becomes the primary.
+    match unixsock.listen(unixsock.abstract_name("unixsock-nv/mirror"), 4)
+        Err(_) => test.assert(true)
+        Ok(l)  =>
+            test.case("with nobody connecting, the set is unchanged")
+            match unixmirror.accept_into(unixmirror.headless_set(), l)
+                Err(_) => test.assert(true)
+                Ok(m)  => test.assert_eq(unixmirror.client_count(m), 0)
+            unixsock.close_listener(l)

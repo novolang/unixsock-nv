@@ -1,0 +1,179 @@
+// unixactivate.nv — the listener the service manager already bound.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// SOCKET ACTIVATION IS A LISTENER THAT ARRIVES AS A NUMBER.  systemd
+// (and launchd, and inetd before both) binds the socket itself, then
+// execs the service with the listening descriptor already open at fd 3
+// and two environment variables saying so: `LISTEN_FDS` counts them and
+// `LISTEN_PID` names the process they were meant for.  The service binds
+// nothing, and a client that connects while the service is still
+// starting is QUEUED by the kernel rather than refused — which is the
+// whole reason the mechanism exists.
+//
+// `LISTEN_PID` IS A CHECK AND NOT A FORMALITY.  The variables are
+// inherited across `fork` and `exec` like any others, so a service that
+// spawns a helper hands it a `LISTEN_FDS=1` naming descriptors the
+// helper does not have.  A helper that trusted the count adopts fd 3 —
+// whatever fd 3 happens to be in that process — and listens on a log
+// file.  `activation()` answers `None` when `LISTEN_PID` is not this
+// process, and `unset_environment` is how a parent stops passing the
+// problem on.
+//
+// THE VARIABLES ARE READ ONCE, WHICH IS WHY THIS IS A VALUE.
+// `unset_environment` exists precisely so they are gone before anything
+// else looks, so a call that read them lazily would answer differently
+// on its second invocation.  `UnixActivation` is what the process was
+// handed, taken at the top of `main` and passed down.
+//
+// `[io]`, BECAUSE THE ENVIRONMENT IS `[io]`.  Nothing here opens a
+// socket: the descriptors are already open, and turning one into a
+// `UnixListener` is `unixsock.listener_of_fd`, which performs nothing
+// at all.
+
+use unixsock
+
+// What the service manager handed this process.
+//
+// `first_fd` is 3 on every implementation, and is carried rather than
+// assumed because a value a reader can see is better than a constant a
+// reader has to know.
+pub struct UnixActivation
+    first_fd: Int
+    count: Int
+    // The names from `LISTEN_FDNAMES`, in the same order, when the
+    // manager supplied them.  Empty otherwise — and a service with two
+    // sockets that guessed which was which by position is a service
+    // that swaps its control socket and its data socket the day
+    // somebody reorders a unit file.
+    names: [Str]
+
+// What the process was handed, or `None`.
+//
+// `None` when there is no activation, and ALSO when `LISTEN_PID` names
+// a different process — which is the inherited-variable case and is the
+// reason this is not a count.
+//
+// ```novo
+// use unixactivate
+//
+// fn inherited() -> ?UnixActivation [io]
+//     unixactivate.activation()
+//
+// fn main() [io]
+//     println("what the service manager passed in")
+// ```
+pub fn activation() -> ?UnixActivation [io]
+    todo("unixsock-nv.unixactivate.activation")
+
+// Remove the activation variables from the environment.
+//
+// So a child this process spawns does not inherit a count of
+// descriptors it was never given.  Call it once, after `activation()`,
+// and before anything is forked.
+//
+// ```novo
+// use unixactivate
+//
+// fn stop_passing_it_on() [io]
+//     unixactivate.unset_environment()
+//
+// fn main() [io]
+//     println("the variables, gone")
+// ```
+pub fn unset_environment() [io]
+    todo("unixsock-nv.unixactivate.unset_environment")
+
+// The descriptor for one of the activated sockets, by position.
+//
+// `None` past the end, rather than `first_fd + n` — which is the
+// arithmetic a caller would otherwise write and which produces a
+// plausible descriptor number for a socket that was never passed.
+//
+// ```novo
+// use unixactivate
+//
+// fn first(a: UnixActivation) -> Int
+//     match unixactivate.fd_at(a, 0)
+//         Some(fd) => fd
+//         None     => 0 - 1
+//
+// fn main() [io]
+//     println("the first activated descriptor")
+// ```
+pub fn fd_at(a: UnixActivation, n: Int) -> ?Int []
+    todo("unixsock-nv.unixactivate.fd_at")
+
+// The descriptor for the socket the unit file named.
+//
+// `LISTEN_FDNAMES` as a lookup, so a service with a control socket and
+// a data socket asks for them by name.  `None` when the manager sent no
+// names or none matched.
+//
+// ```novo
+// use unixactivate
+//
+// fn control(a: UnixActivation) -> Int
+//     match unixactivate.fd_named(a, "control")
+//         Some(fd) => fd
+//         None     => 0 - 1
+//
+// fn main() [io]
+//     println("the socket the unit file called control")
+// ```
+pub fn fd_named(a: UnixActivation, name: Str) -> ?Int []
+    todo("unixsock-nv.unixactivate.fd_named")
+
+// Is this descriptor an AF_UNIX stream socket in the listening state?
+//
+// The check `unixsock.listener_of_fd` asks the caller to have made.
+// Published because adopting a descriptor is an assertion about
+// something this process did not open, and the one call that can settle
+// it is a `getsockopt` the caller should not have to write.
+//
+// ```novo
+// use unixactivate
+//
+// fn ok(fd: Int) -> Bool [net]
+//     unixactivate.is_unix_listener(fd)
+//
+// fn main() [io]
+//     println("whether a descriptor is a listening unix socket")
+// ```
+pub fn is_unix_listener(fd: Int) -> Bool [net]
+    todo("unixsock-nv.unixactivate.is_unix_listener")
+
+// Is this descriptor an AF_UNIX stream socket at all?
+//
+// The weaker question, for a connected descriptor that arrived over
+// `SCM_RIGHTS` rather than from a service manager.
+//
+// ```novo
+// use unixactivate
+//
+// fn ok(fd: Int) -> Bool [net]
+//     unixactivate.is_unix_stream(fd)
+//
+// fn main() [io]
+//     println("whether a descriptor is a unix stream socket")
+// ```
+pub fn is_unix_stream(fd: Int) -> Bool [net]
+    todo("unixsock-nv.unixactivate.is_unix_stream")
+
+// Every activated socket, as listeners.
+//
+// The convenience that ends the arithmetic: a service takes this list
+// and never sees a descriptor number.  The addresses are `UnixUnnamed`,
+// because the manager bound them and this process was not told where.
+//
+// ```novo
+// use unixactivate
+//
+// fn all(a: UnixActivation) -> [UnixListener] [net]
+//     unixactivate.listeners(a)
+//
+// fn main() [io]
+//     println("every socket the manager bound")
+// ```
+pub fn listeners(a: UnixActivation) -> [UnixListener] [net]
+    todo("unixsock-nv.unixactivate.listeners")

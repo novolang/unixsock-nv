@@ -1,0 +1,220 @@
+// unixcred.nv — who is on the other end, and handing them a
+// descriptor.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `SO_PEERCRED` IS THE ONE AUTHENTICATION A UNIX SOCKET GIVES FOR FREE,
+// AND IT IS THE KERNEL'S ANSWER RATHER THAN THE PEER'S.  A process
+// connecting over AF_UNIX cannot lie about its uid: the kernel records
+// the credentials at `connect` time and hands them to the server, which
+// is why a daemon on a socket needs no password to know it is talking
+// to its own user.  A daemon that instead asked the client to say who
+// it was would be trusting a number the client chose.
+//
+// THE CREDENTIALS ARE FROM `connect` TIME, NOT FROM NOW, AND THAT IS
+// LOAD-BEARING.  They are a snapshot: a process that connects and then
+// `setuid`s still reports the uid it had when it connected, and a pid
+// that has exited may have been reused by an unrelated process.  So the
+// uid is an authorisation fact and the PID IS NOT — a server that looked
+// the pid up in `/proc` to decide anything has a race it cannot close,
+// and `UnixPeerCred.pid` is carried for logging and for nothing else.
+// That sentence is the reason this module exists rather than a
+// `peer_uid` function.
+//
+// `SCM_RIGHTS` PASSES A DESCRIPTOR, NOT A NUMBER, AND THAT IS THE
+// WHOLE POINT.  The receiving process gets a descriptor to the SAME
+// open file, at its own number, with its own flags — so a privileged
+// helper can open a file, a socket or a pseudoterminal and hand it to
+// an unprivileged process that could not have opened it.  It also
+// means the number the sender saw is meaningless to the receiver, and
+// an API that passed `Int` in both directions would invite exactly
+// that mistake; `UnixRights` is a value with the descriptors inside it
+// and `receive_with_rights` is the only way to get them out.
+//
+// THE ANCILLARY DATA RIDES A REAL MESSAGE.  `sendmsg` with `SCM_RIGHTS`
+// and a zero-length payload is legal and is dropped by some kernels, so
+// every call here takes at least one byte of payload — a fact a caller
+// that sent an empty frame would discover as descriptors that never
+// arrive, on one machine, intermittently.
+
+// Who the kernel says is on the other end.
+//
+// A snapshot taken at `connect` time.  `uid` and `gid` are what a
+// server authorises on; `pid` is for the log line and must not decide
+// anything, because the process may be gone and the number reused.
+pub struct UnixPeerCred
+    pid: Int
+    uid: Int
+    gid: Int
+
+// Descriptors travelling with a message.
+//
+// The receiver's numbers, not the sender's: `SCM_RIGHTS` duplicates the
+// open file into the receiving process, so the two sides never agree
+// about the integer and only the receiver's is usable.
+pub struct UnixRights
+    fds: [Int]
+    // The kernel dropped some because the receiver's descriptor table
+    // was full or its control buffer too small.  A flag rather than a
+    // silence: descriptors that quietly failed to arrive are a leak on
+    // the sending side and a hang on the receiving one.
+    truncated: Bool
+
+// A message that came with descriptors.
+pub struct UnixRightsMessage
+    payload: Bytes
+    rights: UnixRights
+
+// Why a credentials or descriptor-passing call did not happen.
+pub enum UnixCredFault
+    // The platform has no `SO_PEERCRED`.  Named rather than answered
+    // with zeros, because a server that read uid 0 out of a failed call
+    // would authorise everybody.
+    UnixNoPeerCred
+    // `SCM_RIGHTS` with no payload: legal to write and dropped by some
+    // kernels, so this package refuses it at the call rather than
+    // letting it fail on one machine in ten.
+    UnixEmptyRightsMessage
+    // More descriptors than one message may carry.
+    UnixTooManyRights(asked: Int, limit: Int)
+    // Anything else the kernel said.
+    UnixCredErrno(operation: Str, errno: Int)
+
+// The standard `Error` implementation.
+impl Error for UnixCredFault
+    // One line: what was attempted, and what the kernel said.
+    fn message(self) -> Str
+        todo("unixsock-nv.unixcred.UnixCredFault.message")
+
+// Who is on the other end of this connection.
+//
+// The kernel's answer, taken at `connect` time.  A server's whole
+// authorisation decision, in one call and with no secret anywhere.
+//
+// ```novo
+// use unixcred
+// use unixsock
+//
+// fn who(s: UnixStream) -> Result<UnixPeerCred, UnixCredFault> [net]
+//     unixcred.peer_cred(s)
+//
+// fn main() [io]
+//     println("the uid the kernel recorded")
+// ```
+pub fn peer_cred(s: UnixStream) -> Result<UnixPeerCred, UnixCredFault> [net]
+    todo("unixsock-nv.unixcred.peer_cred")
+
+// Is the peer the same user as this process?
+//
+// The question a single-user daemon actually asks, so that the compare
+// is written once here instead of once per caller — and so that the
+// caller cannot accidentally compare the PID.
+//
+// ```novo
+// use unixcred
+// use unixsock
+//
+// fn mine(s: UnixStream) -> Result<Bool, UnixCredFault> [net, io]
+//     unixcred.peer_is_self(s)
+//
+// fn main() [io]
+//     println("whether the client is this user")
+// ```
+pub fn peer_is_self(s: UnixStream) -> Result<Bool, UnixCredFault> [net, io]
+    todo("unixsock-nv.unixcred.peer_is_self")
+
+// Send a message with descriptors attached.
+//
+// `payload` must be at least one byte: `SCM_RIGHTS` with an empty
+// message is legal and is dropped by some kernels, and this package
+// refuses it here rather than letting a caller discover it as
+// descriptors that intermittently never arrive.
+//
+// ```novo
+// use unixcred
+// use unixsock
+//
+// fn hand_over(s: UnixStream, fd: Int, b: Bytes) -> Result<Int, UnixCredFault> [net]
+//     unixcred.send_with_rights(s, b, [fd])
+//
+// fn main() [io]
+//     println("a descriptor, handed to another process")
+// ```
+pub fn send_with_rights(s: UnixStream, payload: Bytes,
+                        fds: [Int]) -> Result<Int, UnixCredFault> [net]
+    todo("unixsock-nv.unixcred.send_with_rights")
+
+// Take the next message and any descriptors that came with it.
+//
+// `max_fds` sizes the control buffer, and a sender that attached more
+// than that has the excess DROPPED by the kernel with `truncated` set
+// — which is why the flag exists rather than a count comparison.
+//
+// ```novo
+// use unixcred
+// use unixsock
+//
+// fn take(s: UnixStream) -> Result<?UnixRightsMessage, UnixCredFault> [net]
+//     unixcred.receive_with_rights(s, 4096, 4)
+//
+// fn main() [io]
+//     println("a message, and the descriptors on it")
+// ```
+pub fn receive_with_rights(s: UnixStream, max_bytes: Int,
+                           max_fds: Int) -> Result<?UnixRightsMessage, UnixCredFault> [net]
+    todo("unixsock-nv.unixcred.receive_with_rights")
+
+// How many descriptors one message may carry.
+//
+// A kernel limit (253 on Linux), published because a caller passing a
+// list has to know where the boundary is before it builds one — and
+// because a batch that exceeded it fails whole rather than in part.
+//
+// ```novo
+// use unixcred
+//
+// fn main() [io]
+//     println("${unixcred.max_rights_per_message()}")
+// ```
+pub fn max_rights_per_message() -> Int []
+    todo("unixsock-nv.unixcred.max_rights_per_message")
+
+// Close every descriptor in a received message.
+//
+// The cleanup a receiver owes: descriptors arrive OPEN, and a message
+// whose descriptors are dropped without closing leaks one per message
+// until the process hits its limit.  Published as a call because the
+// loop is the same everywhere and forgetting it is silent for hours.
+//
+// ```novo
+// use unixcred
+//
+// fn done(r: UnixRights) [net]
+//     unixcred.close_rights(r)
+//
+// fn main() [io]
+//     println("descriptors that arrived, released")
+// ```
+pub fn close_rights(r: UnixRights) [net]
+    todo("unixsock-nv.unixcred.close_rights")
+
+// Ask the kernel to attach credentials to every message on this socket.
+//
+// `SO_PASSCRED`.  Needed on a DATAGRAM socket, where there is no
+// connection for `SO_PEERCRED` to have recorded anything at — so a
+// receiver that wants to know who sent an event has to turn this on
+// before the first message arrives, and a receiver that turned it on
+// afterwards gets nothing for the messages already queued.
+//
+// ```novo
+// use unixcred
+// use unixsock
+//
+// fn ask(s: UnixStream) -> Result<Unit, UnixCredFault> [net]
+//     unixcred.set_pass_cred(s, true)
+//
+// fn main() [io]
+//     println("credentials, from here on")
+// ```
+pub fn set_pass_cred(s: UnixStream, on: Bool) -> Result<Unit, UnixCredFault> [net]
+    todo("unixsock-nv.unixcred.set_pass_cred")

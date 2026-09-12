@@ -1,0 +1,177 @@
+// unixdgram.nv — AF_UNIX datagram sockets: message boundaries, kept.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A DATAGRAM SOCKET IS NOT A FASTER STREAM SOCKET, IT IS A DIFFERENT
+// CONTRACT.  `SOCK_DGRAM` over AF_UNIX is reliable and ordered like the
+// stream, and it keeps MESSAGE BOUNDARIES: one `send` is one `recv`,
+// and a receiver never has to frame.  That is why a logger, a metrics
+// sink and systemd's own `sd_notify` use it — the protocol is one
+// message per event and framing it would be work with no purpose.
+//
+// THE PRICE IS THAT A MESSAGE TOO BIG IS LOST, NOT SPLIT.  A stream
+// socket takes whatever fits and asks again; a datagram socket that
+// cannot fit the message refuses the whole of it, and a receiver whose
+// buffer is smaller than the message TRUNCATES it and does not say so
+// unless it was asked to.  `UnixDatagramMessage.truncated` is that
+// answer, published rather than inferred, because a receiver that
+// compared the length against its own buffer size cannot tell a message
+// that exactly filled the buffer from one that overflowed it.
+//
+// AND A DATAGRAM SOCKET HAS NO CONNECTION, SO IT HAS NO HANGUP.  There
+// is nothing to notice when the peer goes away: a `send_to` at a path
+// nobody has bound fails, every time, with the same fault, and a sender
+// that wants to know whether anybody is listening has to be told by the
+// protocol rather than by the socket.
+
+use unixsock
+
+// An unconnected datagram socket.
+//
+// Bound or not: a socket that only sends needs no address, and one that
+// expects replies needs one — which is the asymmetry `sd_notify` runs
+// on and the reason `bind` is a separate call rather than part of
+// opening.
+pub struct UnixDatagram
+    fd: Int
+    bound: UnixAddr
+
+// One message, and who sent it.
+//
+// `from` is `UnixUnnamed` when the sender did not bind, which is the
+// common case and is why a reply is not always possible.
+pub struct UnixDatagramMessage
+    payload: Bytes
+    from: UnixAddr
+    // The message was longer than the buffer and the rest is GONE.  A
+    // flag rather than a silence, because a truncated datagram and a
+    // short one are indistinguishable from the payload alone.
+    truncated: Bool
+
+// Open a datagram socket, unbound.
+//
+// ```novo
+// use unixdgram
+//
+// fn sender() -> Result<UnixDatagram, UnixFault> [net]
+//     unixdgram.open()
+//
+// fn main() [io]
+//     println("a socket that can send and cannot be replied to")
+// ```
+pub fn open() -> Result<UnixDatagram, UnixFault> [net]
+    todo("unixsock-nv.unixdgram.open")
+
+// Open a datagram socket bound to an address, so replies can reach it.
+//
+// ```novo
+// use unixdgram
+// use unixsock
+//
+// fn receiver() -> Result<UnixDatagram, UnixFault> [net]
+//     unixdgram.bind(unixsock.abstract_name("novo/metrics"))
+//
+// fn main() [io]
+//     println("a socket with a return address")
+// ```
+pub fn bind(a: UnixAddr) -> Result<UnixDatagram, UnixFault> [net]
+    todo("unixsock-nv.unixdgram.bind")
+
+// Send one message to an address.
+//
+// One call, one datagram, and no partial send: a message that does not
+// fit in the socket buffer is refused whole rather than split, which is
+// the contract the boundary comes from.
+//
+// ```novo
+// use unixdgram
+// use unixsock
+//
+// fn notify(d: UnixDatagram, b: Bytes) -> Result<Int, UnixFault> [net]
+//     unixdgram.send_to(d, unixsock.path("/run/novo/metrics.sock"), b)
+//
+// fn main() [io]
+//     println("one event, one datagram")
+// ```
+pub fn send_to(d: UnixDatagram, to: UnixAddr, payload: Bytes) -> Result<Int, UnixFault> [net]
+    todo("unixsock-nv.unixdgram.send_to")
+
+// Take the next message, or `None` when there is none.
+//
+// `max` is the buffer, and a message longer than it comes back
+// `truncated` with the rest discarded — which is what the kernel does
+// and what a receiver has to be able to see.
+//
+// ```novo
+// use unixdgram
+//
+// fn next(d: UnixDatagram) -> Result<?UnixDatagramMessage, UnixFault> [net]
+//     unixdgram.recv_from(d, 65536)
+//
+// fn main() [io]
+//     println("the next event, whole or not at all")
+// ```
+pub fn recv_from(d: UnixDatagram, max: Int) -> Result<?UnixDatagramMessage, UnixFault> [net]
+    todo("unixsock-nv.unixdgram.recv_from")
+
+// Wait for a message up to a deadline, then take it.
+//
+// ```novo
+// use unixdgram
+//
+// fn next(d: UnixDatagram) -> Result<?UnixDatagramMessage, UnixFault> [net, time]
+//     unixdgram.recv_deadline(d, 65536, 200)
+//
+// fn main() [io]
+//     println("the next event, within two hundred milliseconds")
+// ```
+pub fn recv_deadline(d: UnixDatagram, max: Int,
+                     timeout_ms: Int) -> Result<?UnixDatagramMessage, UnixFault> [net, time]
+    todo("unixsock-nv.unixdgram.recv_deadline")
+
+// The largest datagram this socket will carry.
+//
+// `SO_SNDBUF` in practice, and a number a caller needs BEFORE it builds
+// a message: a sender that discovered the limit by being refused has
+// already spent the work of building the thing that does not fit.
+//
+// ```novo
+// use unixdgram
+//
+// fn limit(d: UnixDatagram) -> Result<Int, UnixFault> [net]
+//     unixdgram.max_message_bytes(d)
+//
+// fn main() [io]
+//     println("how big a message may be")
+// ```
+pub fn max_message_bytes(d: UnixDatagram) -> Result<Int, UnixFault> [net]
+    todo("unixsock-nv.unixdgram.max_message_bytes")
+
+// Close a datagram socket, unlinking a path it bound.
+//
+// ```novo
+// use unixdgram
+//
+// fn done(d: UnixDatagram) [net, io]
+//     unixdgram.close(d)
+//
+// fn main() [io]
+//     println("a datagram socket, and the path it made")
+// ```
+pub fn close(d: UnixDatagram) [net, io]
+    todo("unixsock-nv.unixdgram.close")
+
+// The descriptor underneath, for a caller polling it beside something
+// else.
+//
+// ```novo
+// use unixdgram
+//
+// fn number(d: UnixDatagram) -> Int
+//     unixdgram.fd_of(d)
+//
+// fn main() [io]
+//     println("the descriptor, for somebody else's poll")
+// ```
+pub fn fd_of(d: UnixDatagram) -> Int []
+    todo("unixsock-nv.unixdgram.fd_of")

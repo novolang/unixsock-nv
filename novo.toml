@@ -1,0 +1,67 @@
+[package]
+name        = "unixsock-nv"
+license     = "Apache-2.0"
+version     = "0.0.1"
+description = "AF_UNIX sockets as a package: stream and datagram sockets over a filesystem path or the abstract namespace, peer credentials the kernel vouches for, descriptor passing over SCM_RIGHTS, socket activation as a value, and the primary-plus-mirrors fan-out a multiplexer's daemon runs on.  Interface only — every body is a todo()."
+
+# `license` sits immediately after the name, before any value that could
+# contain a square bracket.  The publish reads it with a pattern that
+# stops at the first `[`, so a description naming an effect row hides it
+# and the release records no licence at all — silently.
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and every row is one of `[net]`, `[net, time]`, `[net, io]` or
+# `[io]`.  There is no `core` half to split out: a socket package with
+# no socket in it is an empty package, and the one thing here that IS
+# arithmetic — the address, the `sun_path` limit, the minimum over the
+# attached clients' sizes — is a handful of functions declaring `[]`
+# inside the host modules rather than a package of its own.
+#
+# WHY `[io]` APPEARS BESIDE `[net]`.  Three things this package does are
+# not socket operations.  Unlinking the path a listener bound is a
+# filesystem operation the runtime's `novo_unix_unlink` performs, and it
+# is the standard library's own row for it.  Reading `LISTEN_FDS` and
+# `LISTEN_PID` is an environment read, which SPEC § 5.1 puts in `[io]`.
+# And `peer_is_self` compares the peer's uid against this process's own,
+# which is a question about the process rather than about the socket.
+# Each of the three is declared where it happens rather than smeared
+# across the package.
+layer       = "host"
+
+category    = "networking"
+
+tags        = ["unix-socket", "af-unix", "scm-rights", "so-peercred", "socket-activation", "ipc"]
+repository  = "https://github.com/novolang/unixsock-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Unix-domain sockets, and who is on the other end"
+
+[dependencies]
+# NONE, and that is a decision rather than an omission.
+#
+# NOT muxproto-nv, although `unixmirror` is the transport that protocol
+# rides.  This package moves BYTES between processes and knows nothing
+# about what they mean: `UnixMirror.frame_state` is an opaque cursor a
+# caller threads through muxproto-nv's decoder, and it is an `Int`
+# precisely so that the socket half and the protocol half can be taken
+# separately.  A program that wants both takes both; a program that
+# wants a Unix socket for an editor's language server takes only this
+# one and gets no terminal multiplexer with it.
+#
+# NOT the standard library's `pty`, although this is the half hoisted
+# out of it.  `std.pty` stays where it is — it is the runtime boundary
+# for `forkpty` and belongs there — and the two coexist.  A program that
+# uses both compiles both; nothing here re-declares a `novo_unix_*`
+# extern, because a duplicate `@ffi` wrapper emits the same LLVM symbol
+# twice and fails IR verification.

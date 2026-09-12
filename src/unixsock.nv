@@ -1,0 +1,566 @@
+// unixsock.nv — AF_UNIX stream sockets: the rendezvous, the listener
+// and the connection.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ADDRESS IS THREE THINGS AND NOT A PATH.  A `sockaddr_un` carries
+// a filesystem path, OR a name in the abstract namespace (Linux's
+// leading NUL, which lives in no directory and disappears when the last
+// holder closes), OR nothing at all — an accepted connection and one
+// half of a socket pair are unnamed.  A package that took a `Str`
+// everywhere could not express the second, and every program that wants
+// a socket no `rm` can break has to reach past it.  `UnixAddr` is the
+// three cases, and `bind` refuses a path longer than the 108 bytes
+// `sun_path` has rather than silently truncating it into a different
+// socket.
+//
+// THE LISTENER OWNS THE PATH, AND THAT IS WHY CLOSING IT IS NOT ENOUGH.
+// Binding a path CREATES a filesystem entry, and closing the socket
+// does NOT remove it: the next `bind` to the same path fails with
+// EADDRINUSE against a socket nobody is listening on.  Every daemon
+// that has ever shipped this bug unlinks first and hopes.  `UnixListener`
+// carries the address it bound so `close` can unlink exactly what it
+// created, `unlink_stale` is the deliberate form of "there was a crash",
+// and an abstract listener needs neither.
+//
+// A READ OF ZERO IS A HANGUP AND A READ OF EAGAIN IS NOT.  The two are
+// the same `-1` in a naive wrapper and they mean opposite things: one
+// says the peer is gone, the other says ask again.  A loop that
+// conflated them either spins at a hundred per cent of a core or
+// reports every idle moment as a disconnect.  `UnixReady` and the
+// `?Int` reads keep them apart, and `read_byte` answers `None` for
+// "nothing yet" while `UnixHangup` is a fault.
+//
+// WHAT MOVES HERE FROM `std.pty`.  The standard library's `pty` module
+// declares nine `novo_unix_*` externs under a comment saying they ride
+// the pty conditional link and hoist "when a second non-pty caller
+// shows up".  This package is that caller.  `std.pty` keeps the
+// pseudoterminal — `forkpty`, the master fd, the window size, the
+// child's exit status — and the socket half lands here.
+
+// Where a Unix-domain socket lives.
+//
+// Three cases, because `sockaddr_un` has three.
+pub enum UnixAddr
+    // A filesystem path.  It is created by `bind` and outlives the
+    // process unless something unlinks it; 108 bytes including the
+    // terminator, on Linux.
+    UnixPath(path: Str)
+    // Linux's abstract namespace: a name with a leading NUL, in no
+    // directory, reclaimed by the kernel when the last holder closes.
+    // Nothing to unlink, no permissions to get wrong, and no stale
+    // entry after a crash — and no way for a program in another mount
+    // namespace to reach it.
+    UnixAbstract(name: Str)
+    // No name at all: an accepted connection, and both ends of a socket
+    // pair.
+    UnixUnnamed
+
+// A connected stream socket.
+//
+// The descriptor and the address the peer bound, when it had one.
+// Non-blocking throughout: every read answers "nothing yet" rather than
+// parking the caller, because the programs this package exists for —
+// a multiplexer's server, an editor's language client — are single
+// event loops with several sources.
+pub struct UnixStream
+    fd: Int
+    peer: UnixAddr
+
+// A listening socket.
+//
+// `bound` is what `close` unlinks.  Carried rather than left to the
+// caller because the caller forgetting is the defect this type exists
+// to prevent.
+pub struct UnixListener
+    fd: Int
+    bound: UnixAddr
+
+// Both ends of an unnamed connected pair.
+//
+// `socketpair(2)`: two connected sockets with no name, no filesystem
+// entry and no race between bind and connect.  What a parent hands a
+// forked child, and the shape to reach for when the two ends are
+// related processes rather than strangers.
+pub struct UnixSocketPair
+    a: UnixStream
+    b: UnixStream
+
+// Which half of a connection to shut down.
+//
+// `shutdown(2)`, and the write half on its own is the one that matters:
+// it sends the peer an end-of-file while this side can still read the
+// answer.  A protocol that says "here is everything, now tell me what
+// you made of it" is this call; a `close` in its place loses the reply.
+pub enum UnixShutdown
+    UnixShutRead
+    UnixShutWrite
+    UnixShutBoth
+
+// What a poll found.
+//
+// Readable and hung-up are SEPARATE, because a hung-up descriptor is
+// permanently readable: a loop that treated the two as one spins at a
+// hundred per cent of a core for as long as the program runs.
+pub struct UnixReady
+    readable: Bool
+    writable: Bool
+    // The peer closed.  Still worth reading once — a peer that wrote
+    // and closed leaves bytes in the buffer.
+    hangup: Bool
+    // The poll expired with nothing ready.
+    timed_out: Bool
+
+// Why a socket operation did not happen.
+//
+// Every arm carries the `errno` the kernel gave, because "connection
+// refused" and "no such file" are the two halves of "the daemon is not
+// running" and a caller starts it in one case and reports a
+// misconfiguration in the other.
+pub enum UnixFault
+    // `connect` found no listener.  The socket file exists and nothing
+    // is behind it — which is what a stale path after a crash looks
+    // like.
+    UnixRefused(addr: Str)
+    // No such path.
+    UnixNoEntry(addr: Str)
+    // `bind` found the address taken.  A live listener, or a stale
+    // socket file: `unlink_stale` is the second case.
+    UnixAddressInUse(addr: Str)
+    // The path is longer than `sun_path`.  Refused rather than
+    // truncated, because a truncated path is a DIFFERENT socket that
+    // binds successfully.
+    UnixPathTooLong(len: Int, limit: Int)
+    // The abstract namespace was asked for on a platform that has none.
+    UnixNoAbstractNamespace
+    // Permission denied on the path, or on the directory holding it.
+    UnixDenied(addr: Str)
+    // The peer closed.
+    UnixHangup
+    // Anything else the kernel said.
+    UnixErrno(operation: Str, errno: Int)
+
+// The standard `Error` implementation, so a socket failure can be
+// reported by anything that reports errors.
+impl Error for UnixFault
+    // One line: what was attempted, on what address, and what the
+    // kernel said.
+    //
+    // The address is in the message rather than left to the caller
+    // because a program with three sockets open gets three identical
+    // messages otherwise.
+    fn message(self) -> Str
+        todo("unixsock-nv.unixsock.UnixFault.message")
+
+// A path address.
+//
+// ```novo
+// use unixsock
+//
+// fn socket() -> UnixAddr
+//     unixsock.path("/run/novomux/default.sock")
+//
+// fn main() [io]
+//     println("a socket that lives in the filesystem")
+// ```
+pub fn path(p: Str) -> UnixAddr []
+    todo("unixsock-nv.unixsock.path")
+
+// An abstract-namespace address.
+//
+// ```novo
+// use unixsock
+//
+// fn socket() -> UnixAddr
+//     unixsock.abstract_name("novomux/default")
+//
+// fn main() [io]
+//     println("a socket no rm can break")
+// ```
+pub fn abstract_name(n: Str) -> UnixAddr []
+    todo("unixsock-nv.unixsock.abstract_name")
+
+// Does this address fit in `sun_path`?
+//
+// 108 bytes on Linux including the terminator, and an abstract name
+// spends one of them on its leading NUL.  Published because the failure
+// it prevents is silent in every wrapper that does not check: a path
+// one byte too long binds a socket at the truncated name, and the
+// client connecting to the full name gets "no such file" while the
+// server reports that it is listening.
+//
+// ```novo
+// use unixsock
+//
+// fn fits(a: UnixAddr) -> Bool
+//     unixsock.addr_fits(a)
+//
+// fn main() [io]
+//     println("whether an address fits in sun_path")
+// ```
+pub fn addr_fits(a: UnixAddr) -> Bool []
+    todo("unixsock-nv.unixsock.addr_fits")
+
+// How many bytes `sun_path` holds on this platform.
+//
+// ```novo
+// use unixsock
+//
+// fn main() [io]
+//     println("${unixsock.sun_path_limit()}")
+// ```
+pub fn sun_path_limit() -> Int []
+    todo("unixsock-nv.unixsock.sun_path_limit")
+
+// Connect to a listener.
+//
+// ```novo
+// use unixsock
+//
+// fn attach(a: UnixAddr) -> Result<UnixStream, UnixFault> [net]
+//     unixsock.connect(a)
+//
+// fn main() [io]
+//     println("a client, attached")
+// ```
+pub fn connect(a: UnixAddr) -> Result<UnixStream, UnixFault> [net]
+    todo("unixsock-nv.unixsock.connect")
+
+// Connect, retrying until a deadline.
+//
+// The shape a launcher needs: a program that forks its own daemon and
+// then connects races the daemon's `bind`, and a single `connect`
+// answers `UnixRefused` about a server that is one millisecond from
+// listening.  The retry is here rather than in every caller because
+// every caller writes it the same way and half of them write it as a
+// busy loop.
+//
+// ```novo
+// use unixsock
+//
+// fn attach(a: UnixAddr) -> Result<UnixStream, UnixFault> [net, time]
+//     unixsock.connect_deadline(a, 2000, 20)
+//
+// fn main() [io]
+//     println("a client that waited for its daemon")
+// ```
+pub fn connect_deadline(a: UnixAddr, timeout_ms: Int,
+                        retry_ms: Int) -> Result<UnixStream, UnixFault> [net, time]
+    todo("unixsock-nv.unixsock.connect_deadline")
+
+// Bind and listen.
+//
+// Does NOT unlink a path that is already there — `unlink_stale` is that
+// decision, and making it automatic is how a second copy of a daemon
+// silently steals the first one's socket.
+//
+// ```novo
+// use unixsock
+//
+// fn serve(a: UnixAddr) -> Result<UnixListener, UnixFault> [net]
+//     unixsock.listen(a, 16)
+//
+// fn main() [io]
+//     println("a server, listening")
+// ```
+pub fn listen(a: UnixAddr, backlog: Int) -> Result<UnixListener, UnixFault> [net]
+    todo("unixsock-nv.unixsock.listen")
+
+// Remove a socket file nothing is listening on.
+//
+// The crash-recovery call, and it is deliberately not part of `listen`.
+// Answers `true` when it removed one, `false` when there was nothing
+// there, and a fault when something IS listening — which is the case a
+// blind `unlink` turns into two daemons, one of them unreachable.
+//
+// ```novo
+// use unixsock
+//
+// fn clean(a: UnixAddr) -> Result<Bool, UnixFault> [net, io]
+//     unixsock.unlink_stale(a)
+//
+// fn main() [io]
+//     println("a socket left by a crash, removed")
+// ```
+pub fn unlink_stale(a: UnixAddr) -> Result<Bool, UnixFault> [net, io]
+    todo("unixsock-nv.unixsock.unlink_stale")
+
+// Take the next connection, or `None` if none is waiting.
+//
+// Non-blocking: `None` is the ordinary answer in a loop that also has a
+// pty and a timer to watch.
+//
+// ```novo
+// use unixsock
+//
+// fn next(l: UnixListener) -> Result<?UnixStream, UnixFault> [net]
+//     unixsock.accept(l)
+//
+// fn main() [io]
+//     println("the next client, if there is one")
+// ```
+pub fn accept(l: UnixListener) -> Result<?UnixStream, UnixFault> [net]
+    todo("unixsock-nv.unixsock.accept")
+
+// Wait for a connection up to a deadline, then take it.
+//
+// ```novo
+// use unixsock
+//
+// fn next(l: UnixListener) -> Result<?UnixStream, UnixFault> [net, time]
+//     unixsock.accept_deadline(l, 5000)
+//
+// fn main() [io]
+//     println("the next client, within five seconds")
+// ```
+pub fn accept_deadline(l: UnixListener,
+                       timeout_ms: Int) -> Result<?UnixStream, UnixFault> [net, time]
+    todo("unixsock-nv.unixsock.accept_deadline")
+
+// Two connected sockets with no name.
+//
+// ```novo
+// use unixsock
+//
+// fn pair() -> Result<UnixSocketPair, UnixFault> [net]
+//     unixsock.socket_pair()
+//
+// fn main() [io]
+//     println("two ends of one pipe that is not a pipe")
+// ```
+pub fn socket_pair() -> Result<UnixSocketPair, UnixFault> [net]
+    todo("unixsock-nv.unixsock.socket_pair")
+
+// One byte, or `None` when there is nothing yet.
+//
+// `None` is EAGAIN and a `UnixHangup` fault is end-of-file, and the
+// whole point of the two answers is that they are different: a loop
+// that read `-1` for both either spins or disconnects on idle.
+//
+// ```novo
+// use unixsock
+//
+// fn one(s: UnixStream) -> Result<?Int, UnixFault> [net]
+//     unixsock.read_byte(s)
+//
+// fn main() [io]
+//     println("one byte, or nothing yet")
+// ```
+pub fn read_byte(s: UnixStream) -> Result<?Int, UnixFault> [net]
+    todo("unixsock-nv.unixsock.read_byte")
+
+// Up to `max` bytes, or an empty buffer when there is nothing yet.
+//
+// One syscall per call rather than one per byte, which is the
+// difference between a language server's edit arriving in a
+// millisecond and in a second.
+//
+// ```novo
+// use unixsock
+//
+// fn some(s: UnixStream) -> Result<Bytes, UnixFault> [net]
+//     unixsock.read(s, 4096)
+//
+// fn main() [io]
+//     println("whatever the kernel had")
+// ```
+pub fn read(s: UnixStream, max: Int) -> Result<Bytes, UnixFault> [net]
+    todo("unixsock-nv.unixsock.read")
+
+// Write the whole buffer.
+//
+// Short writes are retried inside, so a caller never sees a partial
+// one: a stream socket takes what fits in the kernel buffer and says
+// so, and every protocol written against a wrapper that returned the
+// count has a bug in the branch nobody tested.
+//
+// ```novo
+// use unixsock
+//
+// fn send(s: UnixStream, b: Bytes) -> Result<Int, UnixFault> [net]
+//     unixsock.write_all(s, b)
+//
+// fn main() [io]
+//     println("everything, or a fault")
+// ```
+pub fn write_all(s: UnixStream, b: Bytes) -> Result<Int, UnixFault> [net]
+    todo("unixsock-nv.unixsock.write_all")
+
+// Write a whole string.
+//
+// The same call for text, so a caller sending a control frame or a JSON
+// body does not convert first.
+//
+// ```novo
+// use unixsock
+//
+// fn send(s: UnixStream, text: Str) -> Result<Int, UnixFault> [net]
+//     unixsock.write_str(s, text)
+//
+// fn main() [io]
+//     println("a line, sent")
+// ```
+pub fn write_str(s: UnixStream, text: Str) -> Result<Int, UnixFault> [net]
+    todo("unixsock-nv.unixsock.write_str")
+
+// Is this socket ready, within a timeout?
+//
+// `timeout_ms` of 0 polls and returns; a negative value blocks.  The
+// answer separates readable from hung-up, which is the distinction the
+// whole type exists for.
+//
+// ```novo
+// use unixsock
+//
+// fn wait(s: UnixStream) -> Result<UnixReady, UnixFault> [net, time]
+//     unixsock.poll(s, 200)
+//
+// fn main() [io]
+//     println("whether there is anything to do")
+// ```
+pub fn poll(s: UnixStream, timeout_ms: Int) -> Result<UnixReady, UnixFault> [net, time]
+    todo("unixsock-nv.unixsock.poll")
+
+// Is this listener ready to accept, within a timeout?
+//
+// ```novo
+// use unixsock
+//
+// fn wait(l: UnixListener) -> Result<UnixReady, UnixFault> [net, time]
+//     unixsock.poll_listener(l, 200)
+//
+// fn main() [io]
+//     println("whether a client is waiting")
+// ```
+pub fn poll_listener(l: UnixListener, timeout_ms: Int) -> Result<UnixReady, UnixFault> [net, time]
+    todo("unixsock-nv.unixsock.poll_listener")
+
+// Shut down one half of a connection.
+//
+// ```novo
+// use unixsock
+//
+// fn done_sending(s: UnixStream) -> Result<Unit, UnixFault> [net]
+//     unixsock.shutdown(s, UnixShutWrite)
+//
+// fn main() [io]
+//     println("end of file, one way")
+// ```
+pub fn shutdown(s: UnixStream, half: UnixShutdown) -> Result<Unit, UnixFault> [net]
+    todo("unixsock-nv.unixsock.shutdown")
+
+// Close a connection.
+//
+// ```novo
+// use unixsock
+//
+// fn done(s: UnixStream) [net]
+//     unixsock.close(s)
+//
+// fn main() [io]
+//     println("a connection, closed")
+// ```
+pub fn close(s: UnixStream) [net]
+    todo("unixsock-nv.unixsock.close")
+
+// Close a listener and unlink what it bound.
+//
+// The unlink is the reason this is not `close`: a path listener that
+// closed without it leaves a socket file the next `bind` refuses, and
+// an abstract listener has nothing to remove.  One call, so a daemon's
+// shutdown path cannot get half of it right.
+//
+// ```novo
+// use unixsock
+//
+// fn done(l: UnixListener) [net, io]
+//     unixsock.close_listener(l)
+//
+// fn main() [io]
+//     println("a listener, and the path it made")
+// ```
+pub fn close_listener(l: UnixListener) [net, io]
+    todo("unixsock-nv.unixsock.close_listener")
+
+// The descriptor underneath, for a caller that has to poll it beside
+// something this package does not own.
+//
+// A multiplexer waits on its panes' pseudoterminals AND its clients'
+// sockets in one `poll`, and the descriptor is what that call takes.
+// Published rather than hidden, because hiding it would make this
+// package unusable in exactly the program it was extracted from.
+//
+// ```novo
+// use unixsock
+//
+// fn number(s: UnixStream) -> Int
+//     unixsock.fd_of(s)
+//
+// fn main() [io]
+//     println("the descriptor, for somebody else's poll")
+// ```
+pub fn fd_of(s: UnixStream) -> Int []
+    todo("unixsock-nv.unixsock.fd_of")
+
+// The listener's descriptor, for the same reason.
+//
+// ```novo
+// use unixsock
+//
+// fn number(l: UnixListener) -> Int
+//     unixsock.listener_fd_of(l)
+//
+// fn main() [io]
+//     println("the listening descriptor")
+// ```
+pub fn listener_fd_of(l: UnixListener) -> Int []
+    todo("unixsock-nv.unixsock.listener_fd_of")
+
+// Adopt a descriptor this package did not open.
+//
+// Socket activation hands a listening descriptor over the exec, and a
+// forked child inherits one; both are sockets with no `connect` behind
+// them.  The caller is asserting that the number is an AF_UNIX stream
+// socket, which is what `unixactivate.is_unix_stream` checks.
+//
+// ```novo
+// use unixsock
+//
+// fn adopt(fd: Int) -> UnixStream
+//     unixsock.stream_of_fd(fd)
+//
+// fn main() [io]
+//     println("a descriptor somebody else opened")
+// ```
+pub fn stream_of_fd(fd: Int) -> UnixStream []
+    todo("unixsock-nv.unixsock.stream_of_fd")
+
+// Adopt a listening descriptor, with the address it is already bound
+// to.
+//
+// ```novo
+// use unixsock
+//
+// fn adopt(fd: Int) -> UnixListener
+//     unixsock.listener_of_fd(fd, UnixUnnamed)
+//
+// fn main() [io]
+//     println("a listener somebody else bound")
+// ```
+pub fn listener_of_fd(fd: Int, bound: UnixAddr) -> UnixListener []
+    todo("unixsock-nv.unixsock.listener_of_fd")
+
+// The address, as the text a message would name.
+//
+// A path prints as itself; an abstract name prints with a leading `@`,
+// which is what `ss -x` and `lsof` show and therefore what a person can
+// search for; an unnamed socket prints as the empty string.
+//
+// ```novo
+// use unixsock
+//
+// fn main() [io]
+//     println(unixsock.addr_text(unixsock.abstract_name("novomux/default")))
+// ```
+pub fn addr_text(a: UnixAddr) -> Str []
+    todo("unixsock-nv.unixsock.addr_text")

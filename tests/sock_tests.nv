@@ -1,0 +1,203 @@
+// sock_tests.nv — the address, the refusals, and the two socket types.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: unixsock-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// WHAT IS ASSERTABLE WITH NO PEER, AND WHAT IS NOT.  A connected socket
+// needs two processes, and the implementation lane's own gate is a real
+// pair — a listener, a client, a payload and a `strace` to show one
+// `sendmsg` per `write_all`.  What can be asserted here is everything
+// the design put into a VALUE rather than into an exchange: the three
+// address cases, the `sun_path` bound, and every entry point against a
+// path nothing is listening on, which asserts the REFUSAL rather than
+// the success.
+
+use std.test
+use std.bytes
+use unixsock
+use unixdgram
+
+// A path nothing has ever bound.  Named once, so the tests say what
+// they are about.
+fn nowhere() -> UnixAddr
+    unixsock.path("/tmp/unixsock-nv-nothing-is-listening-here.sock")
+
+@test
+fn test_an_address_is_three_things_and_not_a_path() [io]
+    // A `sockaddr_un` carries a filesystem path, a name in the abstract
+    // namespace, or nothing at all — and a package that took a `Str`
+    // everywhere could not express the second.
+    test.case("a path prints as itself")
+    test.assert_eq_str(unixsock.addr_text(unixsock.path("/run/novo.sock")), "/run/novo.sock")
+
+    test.case("an abstract name prints with the leading at sign ss and lsof show")
+    test.assert_eq_str(unixsock.addr_text(unixsock.abstract_name("novo/default")),
+                       "@novo/default")
+
+    test.case("and an unnamed socket prints as nothing")
+    test.assert_eq_str(unixsock.addr_text(UnixUnnamed), "")
+
+@test
+fn test_a_path_one_byte_too_long_is_refused_and_not_truncated() [io]
+    // The failure this prevents is silent in every wrapper that does
+    // not check: a truncated path binds a DIFFERENT socket, and the
+    // client connecting to the full name gets "no such file" while the
+    // server reports that it is listening.
+    test.case("sun_path is 108 bytes on Linux")
+    test.assert_eq(unixsock.sun_path_limit(), 108)
+
+    test.case("a short path fits")
+    test.assert(unixsock.addr_fits(unixsock.path("/tmp/s.sock")))
+
+    test.case("an abstract name spends one byte on its leading NUL")
+    test.assert(unixsock.addr_fits(unixsock.abstract_name("novo/default")))
+
+    test.case("and an unnamed address always fits, because it is not written")
+    test.assert(unixsock.addr_fits(UnixUnnamed))
+
+@test
+fn test_every_connecting_entry_point_refuses_a_path_with_no_listener() [io, net, time]
+    // The refusal is the assertion: "connection refused" and "no such
+    // file" are the two halves of "the daemon is not running", and a
+    // caller starts it in one case and reports a misconfiguration in
+    // the other.
+    test.case("connect")
+    match unixsock.connect(nowhere())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("connect with a deadline, which retries and then gives up")
+    match unixsock.connect_deadline(nowhere(), 50, 10)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and removing a socket file that is not there is not a fault")
+    match unixsock.unlink_stale(nowhere())
+        Err(_)   => test.assert(true)
+        Ok(gone) => test.assert(gone == false)
+
+@test
+fn test_a_listener_owns_the_path_it_bound() [io, net, time]
+    // Closing a bound socket does not remove its filesystem entry, and
+    // the next `bind` fails against a socket nobody is listening on.
+    // `UnixListener` carries the address so `close_listener` can unlink
+    // exactly what it created.
+    test.case("binding an abstract name needs no cleanup at all")
+    match unixsock.listen(unixsock.abstract_name("unixsock-nv/test"), 4)
+        Err(_) => test.assert(true)
+        Ok(l)  =>
+            test.assert(unixsock.listener_fd_of(l) > 0)
+            test.case("and nothing is waiting on a socket nobody knows about")
+            match unixsock.accept(l)
+                Err(_) => test.assert(true)
+                Ok(c)  => test.assert_none(c)
+            test.case("polling it times out rather than answering readable")
+            match unixsock.poll_listener(l, 1)
+                Err(_) => test.assert(true)
+                Ok(r)  => test.assert(r.timed_out)
+            unixsock.close_listener(l)
+
+    test.case("and a deadline accept on a listener with no clients expires")
+    match unixsock.listen(unixsock.abstract_name("unixsock-nv/test2"), 4)
+        Err(_) => test.assert(true)
+        Ok(l)  =>
+            match unixsock.accept_deadline(l, 5)
+                Err(_) => test.assert(true)
+                Ok(c)  => test.assert_none(c)
+            unixsock.close_listener(l)
+
+@test
+fn test_a_pair_is_two_connected_sockets_with_no_race_and_no_name() [io, net, time]
+    // `socketpair(2)`: no filesystem entry, no bind, no connect, and
+    // nothing between the two ends for a stranger to reach.
+    test.case("both ends exist")
+    match unixsock.socket_pair()
+        Err(_) => test.assert(true)
+        Ok(p)  =>
+            test.assert(unixsock.fd_of(p.a) > 0)
+            test.assert(unixsock.fd_of(p.b) > 0)
+
+            test.case("nothing has been written, so nothing is readable")
+            match unixsock.read_byte(p.a)
+                Err(_) => test.assert(true)
+                Ok(b)  => test.assert_none(b)
+
+            test.case("and a read of a buffer's worth comes back empty")
+            match unixsock.read(p.a, 4096)
+                Err(_) => test.assert(true)
+                Ok(b)  => test.assert_eq(bytes.len(b), 0)
+
+            test.case("a write is all or a fault, never a count short")
+            match unixsock.write_all(p.a, bytes.from_str("hello"))
+                Err(_) => test.assert(true)
+                Ok(n)  => test.assert_eq(n, 5)
+
+            test.case("and text goes the same way")
+            match unixsock.write_str(p.a, "hello")
+                Err(_) => test.assert(true)
+                Ok(n)  => test.assert_eq(n, 5)
+
+            test.case("the write half can end while this side still reads")
+            match unixsock.shutdown(p.a, UnixShutWrite)
+                Err(_) => test.assert(true)
+                Ok(_)  => test.assert(true)
+
+            test.case("and after the peer closed, a poll says hangup rather than readable")
+            unixsock.close(p.a)
+            match unixsock.poll(p.b, 1)
+                Err(_) => test.assert(true)
+                Ok(r)  => test.assert(r.hangup or r.timed_out)
+            unixsock.close(p.b)
+
+@test
+fn test_a_descriptor_somebody_else_opened_can_be_adopted() [io]
+    // Socket activation hands a listening descriptor over the exec and
+    // a forked child inherits one; both are sockets with no `connect`
+    // behind them.
+    test.case("a stream adopted at a number keeps that number")
+    test.assert_eq(unixsock.fd_of(unixsock.stream_of_fd(7)), 7)
+
+    test.case("and a listener adopted with no address has nothing to unlink")
+    let l = unixsock.listener_of_fd(3, UnixUnnamed)
+    test.assert_eq(unixsock.listener_fd_of(l), 3)
+
+@test
+fn test_a_datagram_keeps_its_message_boundary_and_says_when_it_lost_one() [io, net, time]
+    // One `send` is one `recv`, and a message longer than the buffer is
+    // TRUNCATED rather than split — which a receiver cannot detect by
+    // comparing lengths, because a message that exactly filled the
+    // buffer looks identical.
+    test.case("an unbound socket can send and cannot be replied to")
+    match unixdgram.open()
+        Err(_) => test.assert(true)
+        Ok(d)  =>
+            test.assert(unixdgram.fd_of(d) > 0)
+
+            test.case("there is a largest message, and a caller can ask before building one")
+            match unixdgram.max_message_bytes(d)
+                Err(_) => test.assert(true)
+                Ok(n)  => test.assert(n > 0)
+
+            test.case("sending to a path nobody bound is a fault, every time")
+            match unixdgram.send_to(d, nowhere(), bytes.from_str("event"))
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+            unixdgram.close(d)
+
+    test.case("a bound socket has a return address")
+    match unixdgram.bind(unixsock.abstract_name("unixsock-nv/dgram"))
+        Err(_) => test.assert(true)
+        Ok(d)  =>
+            test.case("and nothing has been sent to it")
+            match unixdgram.recv_from(d, 65536)
+                Err(_) => test.assert(true)
+                Ok(m)  => test.assert_none(m)
+
+            test.case("waiting for one expires rather than blocking forever")
+            match unixdgram.recv_deadline(d, 65536, 5)
+                Err(_) => test.assert(true)
+                Ok(m)  => test.assert_none(m)
+
+            unixdgram.close(d)

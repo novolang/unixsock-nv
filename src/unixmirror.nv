@@ -1,0 +1,313 @@
+// unixmirror.nv — one session, several attached clients.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LOAD-BEARING INTERFACE OF THIS PACKAGE IS `UnixMirrorSet`, AND
+// WHAT IT CARRIES IS THAT THE CLIENTS ARE NOT PEERS.  A multiplexer's
+// server has ONE primary — the client whose keystrokes drive the
+// session — and any number of MIRRORS, which see every byte of output
+// and, in this shape, may also send input.  A design with a flat list
+// of clients cannot say which one owns the session, and the first
+// question a server asks on every tick is exactly that.
+//
+// EVERY MIRROR HAS ITS OWN FRAME STATE, AND THAT IS NOT AN
+// OPTIMISATION.  Control frames arrive interleaved from several
+// sockets, so a single decoder shared across clients splices the first
+// half of one client's frame onto the second half of another's and
+// acts on a verb neither of them sent.  `UnixMirrorSet` keeps a
+// per-client parser slot for that reason, and the parser itself is
+// muxproto-nv's — this module owns the SOCKETS and the fan-out and
+// knows nothing about what the frames mean.
+//
+// A DETACHED PRIMARY IS PROMOTED, NOT WAITED FOR.  When the primary
+// goes away and a mirror is still attached, the session keeps a driver:
+// `promote_if_detached` makes the most recent mirror the primary.  A
+// server that waited for a brand-new connection instead leaves every
+// remaining viewer watching a session nothing can type into.
+//
+// SMALLEST CLIENT WINS.  Two clients at different terminal sizes cannot
+// both see the whole session, so the effective size is the minimum over
+// everyone attached — and it has to be recomputed on every attach and
+// every detach, not only on resize.  `effective_size` is that
+// computation, and it is `[]`: the sizes are values the caller already
+// has.
+//
+// WHAT MOVES HERE FROM `std.pty`.  The runtime's mirror machinery —
+// accept-as-mirror, fan-out on write, drain-mirror-input, promote,
+// count — is socket bookkeeping that ended up inside a pseudoterminal
+// module because that is where the first caller was.  `std.pty` keeps
+// the pty; this is the fan-out.
+
+// One attached client.
+//
+// `primary` is the one whose input drives the session.  `rows` and
+// `cols` are what that client last reported, and they are what
+// `effective_size` minimises over.
+pub struct UnixMirror
+    stream: UnixStream
+    primary: Bool
+    rows: Int
+    cols: Int
+    // Where this client's own control-frame parser had got to.  An
+    // opaque cursor this module threads and does not interpret;
+    // muxproto-nv is what reads it.
+    frame_state: Int
+
+// Every client attached to one session.
+//
+// A value the server threads, so a session is a value and not a table
+// keyed by descriptor somewhere global.
+pub struct UnixMirrorSet
+    clients: [UnixMirror]
+    // No client is attached and the session runs anyway.  A headless
+    // session is the whole point of a daemon: the shells keep running,
+    // the grids keep filling, and the first client to connect is
+    // promoted straight to primary.
+    headless: Bool
+    // How many clients have attached since this counter was last read.
+    // Read-and-clear, so a log records every reattach and not only the
+    // first — a session that dropped and recovered four times looks
+    // identical to one that never dropped, otherwise.
+    reattaches: Int
+
+// An empty set, headless.
+//
+// What a daemon starts with: no client, and the session running.
+//
+// ```novo
+// use unixmirror
+//
+// fn fresh() -> UnixMirrorSet
+//     unixmirror.headless_set()
+//
+// fn main() [io]
+//     println("a session with nobody watching")
+// ```
+pub fn headless_set() -> UnixMirrorSet []
+    todo("unixsock-nv.unixmirror.headless_set")
+
+// Take the next connection, if any, and file it.
+//
+// The FIRST client becomes the primary; every one after it is a
+// mirror.  One call per tick, non-blocking, so a server's loop has one
+// place where clients appear.
+//
+// ```novo
+// use unixmirror
+// use unixsock
+//
+// fn tick(m: UnixMirrorSet, l: UnixListener) -> Result<UnixMirrorSet, UnixFault> [net]
+//     unixmirror.accept_into(m, l)
+//
+// fn main() [io]
+//     println("whoever turned up this tick")
+// ```
+pub fn accept_into(m: UnixMirrorSet, l: UnixListener) -> Result<UnixMirrorSet, UnixFault> [net]
+    todo("unixsock-nv.unixmirror.accept_into")
+
+// Write one buffer to every attached client.
+//
+// The fan-out: the primary first, then the mirrors in attach order, so
+// the client driving the session never waits behind a viewer on a slow
+// link.  A client whose write fails is DROPPED from the set rather than
+// retried — a viewer that went away must not be able to stall the
+// session for everybody else.
+//
+// ```novo
+// use unixmirror
+//
+// fn emit(m: UnixMirrorSet, b: Bytes) -> Result<UnixMirrorSet, UnixFault> [net]
+//     unixmirror.broadcast(m, b)
+//
+// fn main() [io]
+//     println("one screen, everywhere")
+// ```
+pub fn broadcast(m: UnixMirrorSet, b: Bytes) -> Result<UnixMirrorSet, UnixFault> [net]
+    todo("unixsock-nv.unixmirror.broadcast")
+
+// Read whatever every client has sent, without mixing their streams.
+//
+// Answers one buffer PER CLIENT rather than one concatenated buffer,
+// which is the whole reason the per-client frame state exists: two
+// clients sending control frames in the same tick have their bytes
+// interleaved on arrival, and a decoder fed the concatenation reads a
+// frame neither of them wrote.
+//
+// ```novo
+// use unixmirror
+//
+// fn input(m: UnixMirrorSet) -> Result<UnixMirrorDrain, UnixFault> [net]
+//     unixmirror.drain_input(m, 4096)
+//
+// fn main() [io]
+//     println("what each client typed, kept apart")
+// ```
+pub fn drain_input(m: UnixMirrorSet,
+                   max_per_client: Int) -> Result<UnixMirrorDrain, UnixFault> [net]
+    todo("unixsock-nv.unixmirror.drain_input")
+
+// What one drain found: the set, and one buffer per client.
+//
+// `chunks` is the same length as the set's `clients` and in the same
+// order, so a caller pairs them by position and never has to match a
+// descriptor back to a client.
+pub struct UnixMirrorDrain
+    set: UnixMirrorSet
+    chunks: [Bytes]
+
+// Make the most recent mirror the primary, if the primary has gone.
+//
+// Answers the set and whether it promoted, because "the session has a
+// new driver" is a log line a person wants and a boolean nobody
+// returned is a log line nobody writes.
+//
+// ```novo
+// use unixmirror
+//
+// fn tick(m: UnixMirrorSet) -> UnixMirrorPromotion
+//     unixmirror.promote_if_detached(m)
+//
+// fn main() [io]
+//     println("a viewer, promoted to driver")
+// ```
+pub fn promote_if_detached(m: UnixMirrorSet) -> UnixMirrorPromotion []
+    todo("unixsock-nv.unixmirror.promote_if_detached")
+
+// The set after a promotion, and whether one happened.
+pub struct UnixMirrorPromotion
+    set: UnixMirrorSet
+    promoted: Bool
+
+// Detach the primary, keeping the session running.
+//
+// What a detach key does.  The set keeps every mirror; if there are
+// none, the session goes headless rather than ending — which is the
+// difference between a multiplexer and a terminal.
+//
+// ```novo
+// use unixmirror
+//
+// fn detach(m: UnixMirrorSet) -> Result<UnixMirrorSet, UnixFault> [net, io]
+//     unixmirror.detach_primary(m)
+//
+// fn main() [io]
+//     println("the driver left; the session did not")
+// ```
+pub fn detach_primary(m: UnixMirrorSet) -> Result<UnixMirrorSet, UnixFault> [net, io]
+    todo("unixsock-nv.unixmirror.detach_primary")
+
+// Record the size a client reported.
+//
+// ```novo
+// use unixmirror
+//
+// fn resized(m: UnixMirrorSet) -> UnixMirrorSet
+//     unixmirror.set_size(m, 0, 40, 120)
+//
+// fn main() [io]
+//     println("one client's terminal, remeasured")
+// ```
+pub fn set_size(m: UnixMirrorSet, client: Int, rows: Int, cols: Int) -> UnixMirrorSet []
+    todo("unixsock-nv.unixmirror.set_size")
+
+// The size every attached client can see: the minimum of all of them.
+//
+// `None` when nobody is attached, because a headless session has no
+// size to be — and a server that defaulted to 24 by 80 there resizes
+// every shell twice the moment somebody attaches.
+//
+// ```novo
+// use unixmirror
+//
+// fn size(m: UnixMirrorSet) -> ?(Int, Int)
+//     unixmirror.effective_size(m)
+//
+// fn main() [io]
+//     println("the size the smallest client can see")
+// ```
+pub fn effective_size(m: UnixMirrorSet) -> ?(Int, Int) []
+    todo("unixsock-nv.unixmirror.effective_size")
+
+// How many clients are attached.
+//
+// ```novo
+// use unixmirror
+//
+// fn watching(m: UnixMirrorSet) -> Int
+//     unixmirror.client_count(m)
+//
+// fn main() [io]
+//     println("how many people are looking")
+// ```
+pub fn client_count(m: UnixMirrorSet) -> Int []
+    todo("unixsock-nv.unixmirror.client_count")
+
+// The reattach counter, read and cleared.
+//
+// Read-and-clear rather than a running total, so a pump that logs it
+// each tick prints a line per reattach and nothing in between.
+//
+// ```novo
+// use unixmirror
+//
+// fn since_last(m: UnixMirrorSet) -> UnixMirrorCount
+//     unixmirror.take_reattaches(m)
+//
+// fn main() [io]
+//     println("how many clients came back")
+// ```
+pub fn take_reattaches(m: UnixMirrorSet) -> UnixMirrorCount []
+    todo("unixsock-nv.unixmirror.take_reattaches")
+
+// The set with the counter cleared, and what it held.
+pub struct UnixMirrorCount
+    set: UnixMirrorSet
+    count: Int
+
+// The primary's stream, if there is one.
+//
+// ```novo
+// use unixmirror
+// use unixsock
+//
+// fn driver(m: UnixMirrorSet) -> ?UnixStream
+//     unixmirror.primary_of(m)
+//
+// fn main() [io]
+//     println("the client driving the session")
+// ```
+pub fn primary_of(m: UnixMirrorSet) -> ?UnixStream []
+    todo("unixsock-nv.unixmirror.primary_of")
+
+// Every client's descriptor, for a caller polling them beside its
+// pseudoterminals.
+//
+// One list, in the set's own order, so a poll result maps back by
+// position.  This is the call that makes the package usable inside an
+// event loop it does not own.
+//
+// ```novo
+// use unixmirror
+//
+// fn watched(m: UnixMirrorSet) -> [Int]
+//     unixmirror.fds_of(m)
+//
+// fn main() [io]
+//     println("every client descriptor, in order")
+// ```
+pub fn fds_of(m: UnixMirrorSet) -> [Int] []
+    todo("unixsock-nv.unixmirror.fds_of")
+
+// Drop a client and close its socket.
+//
+// ```novo
+// use unixmirror
+//
+// fn gone(m: UnixMirrorSet) -> UnixMirrorSet [net]
+//     unixmirror.remove(m, 1)
+//
+// fn main() [io]
+//     println("a client that went away")
+// ```
+pub fn remove(m: UnixMirrorSet, client: Int) -> UnixMirrorSet [net]
+    todo("unixsock-nv.unixmirror.remove")
