@@ -1,7 +1,7 @@
 [package]
 name        = "unixsock-nv"
 license     = "Apache-2.0"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "AF_UNIX sockets as a package: stream and datagram sockets over a filesystem path or the abstract namespace, peer credentials the kernel vouches for, descriptor passing over SCM_RIGHTS, socket activation as a value, and the primary-plus-mirrors fan-out a multiplexer's daemon runs on.  Interface only — every body is a todo()."
 
 # `license` sits immediately after the name, before any value that could

@@ -1,249 +1,295 @@
 # unixsock-nv
 
-Unix-domain sockets as a package: the rendezvous, the listener, the
-connection, who the kernel says is on the other end, and the fan-out a
-multiplexer's daemon runs on.
+A Unix-domain socket connects two processes on the same machine. It is
+the `AF_UNIX` address family of the POSIX socket API, and its address is
+a path in the filesystem rather than an internet address and a port.
+Linux's [unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html) and
+the [POSIX socket calls](https://pubs.opengroup.org/onlinepubs/9699919799/functions/socket.html)
+are what this package ports. It sits beside `std.net` in the standard
+library: `std.net` is TCP, which reaches another machine over a port,
+and this package reaches another process over a path.
+[muxproto-nv](https://novo-lang.org/packages/muxproto-nv) is the control
+protocol whose frames travel over the sockets this package fans out; it
+is a separate package, and this one depends on nothing.
 
-**Status: NOT IMPLEMENTED — interface only.**  Every `pub fn` body is a
-`todo()`, so the signatures, the effect rows and the tests are published
-and nothing is implemented.  The first implementation is the `0.1.0`
-published over this.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What a Unix-domain socket is
 
-The standard library's `pty` module declares nine `novo_unix_*` externs
-under a comment that says what they are doing there:
+The address of a Unix-domain socket is a `sockaddr_un`, a structure
+whose `sun_path` field holds the name. unix(7) gives that name three
+forms. A **pathname** socket is a file the `bind` call creates in a
+directory. An **abstract** socket has a name beginning with a null byte,
+lives in no directory, and is reclaimed by the kernel when the last
+holder closes it; it is a Linux extension. An **unnamed** socket has no
+address at all, which is what an accepted connection and both halves of
+a socket pair are.
 
-> Riding the `std.pty` conditional-link cascade: any user that triggers
-> `novo_pty_` auto-pulls these too.  Hoist into `std.unix.*` when a
-> second non-pty caller shows up.
+Two socket types run over that address. A **stream** socket,
+`SOCK_STREAM`, is a byte stream with no message boundaries, like TCP. A
+**datagram** socket, `SOCK_DGRAM`, keeps message boundaries: one send is
+one receive, and over `AF_UNIX` it is reliable and ordered as well. A
+logger, a metrics sink and systemd's `sd_notify` use the datagram form,
+because one event is one message and there is nothing to frame.
 
-This package is that caller.  An editor talking to a language server, a
-service that was socket-activated, a build daemon, a privileged helper
-handing a descriptor to an unprivileged process — none of them want a
-pseudoterminal, and today all of them have to trigger one to get a Unix
-socket.
+Two things a Unix-domain socket can do that no network socket can. The
+kernel records the connecting process's credentials at `connect` time
+and hands them to the server, which reads them with the `SO_PEERCRED`
+socket option; the peer cannot lie about its user id. And a process can
+send an open file descriptor to another process in an ancillary message
+of type `SCM_RIGHTS`. The receiver gets a descriptor to the same open
+file, at its own number, so a privileged helper can open a file the
+receiver could not have opened and hand it over.
 
-Five modules, and a reader should know which one they are on.
+**Socket activation** is a listening socket a service did not create. A
+service manager binds it, then executes the service with the descriptor
+already open and two environment variables saying so: `LISTEN_FDS`
+counts them and `LISTEN_PID` names the process they were meant for. A
+client that connects while the service is still starting is queued by
+the kernel instead of refused.
 
-| surface | module | reach for it when |
+| Fact | Value | Where |
 | --- | --- | --- |
-| the **sockets** | `unixsock` | anything. Start here |
-| the **messages** | `unixdgram` | one send is one receive |
-| the **peer** | `unixcred` | you need to know who, or to hand over a descriptor |
-| the **inherited listener** | `unixactivate` | systemd, launchd or inetd bound it for you |
-| the **fan-out** | `unixmirror` | several clients are attached to one session |
+| Bytes in `sun_path`, terminator included | 108 on Linux | unix(7), "Address format" |
+| Bytes an abstract name spends on its leading null | 1 | unix(7), "Abstract sockets" |
+| Descriptors one `SCM_RIGHTS` message may carry | 253 on Linux | unix(7), "Ancillary messages" |
+| The first descriptor a service manager passes | 3 | sd_listen_fds(3) |
+| The variables an activation sets | `LISTEN_FDS`, `LISTEN_PID`, `LISTEN_FDNAMES` | sd_listen_fds(3) |
 
-Sixty public functions and two `Error` implementations, every body a
-`todo()`.
+## Install
 
-## The load-bearing interface
-
-```novo norun:pseudo
-pub struct UnixMirrorSet
-    clients: [UnixMirror]
-    headless: Bool
-    reattaches: Int
+```
+novo pkg add unixsock-nv
 ```
 
-**The clients attached to one session are not peers, and the set is what
-says so.**  A multiplexer's server has ONE primary — the client whose
-keystrokes drive the session — and any number of mirrors, which see
-every byte of output.  A flat list of clients cannot express that, and
-"which of these is driving" is the first question the server asks on
-every tick.
-
-Three consequences fall straight out of the type, and each one is a bug
-in the shape that does not have it:
-
-- **Every client keeps its own frame-parser cursor.**  Control frames
-  arrive interleaved from several sockets, so one shared decoder splices
-  the first half of one client's frame onto the second half of
-  another's and acts on a verb neither of them sent.
-- **A detached primary is promoted, not waited for.**
-  `promote_if_detached` makes the most recent mirror the driver, because
-  a server that waited for a new connection leaves every remaining
-  viewer watching a session nothing can type into.
-- **`headless` is a state and not an absence.**  A daemon with no client
-  attached is the ordinary case, and `effective_size` answers `None`
-  there rather than 24 by 80 — a default would resize every shell twice
-  the moment somebody attaches.
-
-`unixmirror` owns the sockets and the fan-out and knows nothing about
-what the frames mean; `UnixMirror.frame_state` is an opaque `Int` a
-caller threads through muxproto-nv's decoder.  That is why this package
-has no dependency on it.
-
-## The one example that will work
+## Example
 
 ```novo
+use unixcred
 use unixsock
 
-// Attach to a daemon, waiting out the race between the launcher's fork
-// and the daemon's bind.
-fn attach(name: Str) -> Result<UnixStream, UnixFault> [net, time]
-    unixsock.connect_deadline(unixsock.abstract_name(name), 2000, 20)
+fn main() [io, net, time]
+    // The address of a daemon's socket, in the abstract namespace.
+    // Nothing is created in the filesystem and nothing is left behind.
+    let addr = unixsock.abstract_name("novo/example")
 
-fn main() [io]
-    println("a client that waited for its daemon")
+    // Connect, retrying every 20 milliseconds for up to two seconds.
+    match unixsock.connect_deadline(addr, 2000, 20)
+        Err(e) => println("no daemon there: ${e.message()}")
+        Ok(s) =>
+            // Ask the kernel who is on the other end. The user id is
+            // the one fact a server may authorise on.
+            match unixcred.peer_cred(s)
+                Ok(who) => println("the peer runs as uid ${who.uid}")
+                Err(c)  => println("no credentials here: ${c.message()}")
+
+            // Send one line, then close the connection.
+            match unixsock.write_str(s, "hello\n")
+                Ok(n)  => println("${n} bytes sent")
+                Err(w) => println("the write failed: ${w.message()}")
+            unixsock.close(s)
 ```
 
-## Adding it, and checking it
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a
+`not implemented: unixsock-nv.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
 
-```console
-$ novo pkg add unixsock-nv
-$ novo pkg build
-$ novo test --isolate tests/sock_tests.nv
+## What the package contains
+
+| Module | Contents |
+| --- | --- |
+| `unixsock` | Stream sockets: the three address forms, the listener, the connection, the socket pair, reads and writes, poll and shutdown. |
+| `unixdgram` | Datagram sockets, where one send is one receive and a message longer than the buffer is reported as truncated. |
+| `unixcred` | The peer's credentials from `SO_PEERCRED`, and descriptor passing over `SCM_RIGHTS`. |
+| `unixactivate` | The listening descriptors a service manager passed, as a value, with the `LISTEN_PID` check. |
+| `unixmirror` | Several clients attached to one session: one of them drives it, the rest receive a copy of every byte. |
+
+## How to choose an entry point
+
+**`unixsock` is where a program starts.** It is the stream socket, and a
+stream socket is what a language server, a build daemon or a privileged
+helper talks over.
+
+**`unixdgram` is for one message at a time.** Use it when every send is
+one complete event and the receiver must not have to frame anything. It
+has no connection, so it has no hangup: a send to a path nobody has
+bound fails, and a sender learns nothing else about who is listening.
+
+**`unixsock.socket_pair` is for two related processes.** It answers two
+connected sockets with no name and no filesystem entry, so there is no
+race between a bind and a connect. A parent hands one half to a child it
+forked.
+
+**`unixmirror` is for one session with several clients attached.** It
+owns the fan-out and knows nothing about what the bytes mean. A program
+with one client per connection does not need it.
+
+## The rules a user needs
+
+1. **Closing a bound listener does not remove its path.** unix(7),
+   "Binding". A `bind` on a pathname address creates a filesystem entry,
+   and the next `bind` to that path fails with `EADDRINUSE` even though
+   nobody is listening. `close_listener` closes the socket and unlinks
+   the address the listener carries, in one call. An abstract listener
+   has nothing to remove.
+2. **`unlink_stale` is the crash-recovery call and it is deliberate.**
+   It answers `true` when it removed a socket file, `false` when there
+   was nothing there, and a fault when something is still listening.
+   `listen` never unlinks for you, so a second copy of a daemon cannot
+   take the first one's socket.
+3. **A path one byte too long binds a different socket.** unix(7),
+   "Address format": `sun_path` is 108 bytes and a longer path is
+   truncated, not refused. The server then reports that it is listening
+   and the client gets "no such file". `addr_fits` answers before the
+   bind, and `bind` refuses with `UnixPathTooLong`.
+4. **An abstract name is Linux only.** unix(7), "Abstract sockets". On a
+   platform without the namespace the call answers
+   `UnixNoAbstractNamespace`. An abstract socket is also unreachable
+   from another mount namespace, where a pathname socket can be shared.
+   `addr_text` prints an abstract name with a leading `@`, which is what
+   `ss -x` and `lsof` show.
+5. **"Nothing to read yet" and "the peer is gone" are different
+   answers.** Both are `-1` from `read(2)`. `read_byte` answers `None`
+   for the first and the `UnixHangup` fault for the second, and
+   `UnixReady` keeps `readable` and `hangup` in separate fields. A loop
+   that treats them as one spins at full speed, or reports every idle
+   moment as a disconnect. Every read here is non-blocking.
+6. **A truncated datagram looks exactly like a short one.** unix(7),
+   `SOCK_DGRAM`: a message longer than the receive buffer is truncated
+   and the rest is discarded. Comparing lengths cannot detect it,
+   because a message that exactly filled the buffer is
+   indistinguishable. Read `UnixDatagramMessage.truncated`.
+7. **A descriptor sent over `SCM_RIGHTS` needs at least one byte of
+   payload.** unix(7), "Ancillary messages". A zero-length message with
+   ancillary data is legal to write and is dropped by some kernels, so
+   `send_with_rights` refuses it at the call. The descriptors that
+   arrive are the receiver's own numbers, they arrive open, and
+   `close_rights` is what releases them.
+8. **The peer's credentials are a snapshot taken at `connect` time.**
+   unix(7), `SO_PEERCRED`. The user id and group id are what a server
+   authorises on. The process id is for a log line: the process may have
+   exited and the number been reused, so nothing may be decided from it.
+   A datagram socket has no connection, so a receiver that wants
+   credentials calls `set_pass_cred` before the first message arrives.
+9. **`LISTEN_PID` is a check and not a formality.** sd_listen_fds(3).
+   The activation variables are inherited across `fork` and `exec`, so a
+   helper a service spawns sees `LISTEN_FDS=1` naming descriptors it was
+   never given. `activation()` answers `None` when `LISTEN_PID` is not
+   this process, and `unset_environment` stops a child inheriting the
+   problem. Read the variables once, at the top of `main`.
+10. **The clients of one session are not peers.** `unixmirror` keeps one
+    primary, whose input drives the session, and any number of mirrors,
+    which receive every byte of output. Each client carries its own
+    frame-parser cursor, because frames from several sockets arrive
+    interleaved and one shared decoder joins the front of one client's
+    frame to the back of another's. `drain_input` therefore answers one
+    buffer per client, in the set's own order.
+11. **A session with no client attached keeps running.**
+    `effective_size` answers `None` there rather than a default size, so
+    nothing is resized twice when a client attaches. The effective size
+    is the smallest attached client's, recomputed on every attach and
+    every detach. `promote_if_detached` makes the most recent mirror the
+    primary when the primary leaves.
+12. **`write_all` retries short writes, and `broadcast` drops a client
+    that fails.** A stream socket accepts what fits in the kernel buffer
+    and reports the count; `write_all` sends the whole buffer or answers
+    a fault. In the fan-out the primary is written first, and a client
+    whose write fails is removed from the set rather than retried.
+
+## What is not included
+
+- **`SOCK_SEQPACKET`.** The third socket type keeps message boundaries
+  and has a connection. Linux supports it and macOS does not, so there
+  is no portable behaviour to publish.
+- **Peer credentials on macOS.** `LOCAL_PEERCRED` has a different
+  structure and carries no process id. `peer_cred` answers
+  `UnixNoPeerCred` there, because a server that read a user id of 0 out
+  of a failed call would authorise everybody.
+- **Asynchronous entry points.** Every read is non-blocking and every
+  call returns to its caller, so an event loop composes them. `fd_of`,
+  `listener_fd_of` and `fds_of` hand out the descriptors for a `poll`
+  this package does not own.
+- **A connection pool, a framing layer and a request-response shape.**
+  All three are protocols, and this package is the transport.
+- **The pseudoterminal.** `forkpty`, the terminal's raw mode, the window
+  size and the child's exit status stay in the standard library's `pty`
+  module and in [pty-nv](https://novo-lang.org/packages/pty-nv).
+- **What the frames mean.** `UnixMirror.frame_state` is an opaque cursor
+  this package threads and never interprets. The decoder is
+  [muxproto-nv](https://novo-lang.org/packages/muxproto-nv)'s.
+
+## Related packages
+
+- `std.net` in the standard library is the TCP half: `TcpListener` and
+  `TcpStream`, an address and a port, and a peer on any machine. It has
+  no `AF_UNIX` surface, no peer credentials and no descriptor passing.
+  Use it to reach another machine and this package to reach another
+  process on this one.
+- [muxproto-nv](https://novo-lang.org/packages/muxproto-nv) is the
+  terminal multiplexer's control protocol, and it performs no input or
+  output. It reads the frames that arrive on the sockets `unixmirror`
+  holds. Take both to build a multiplexer; take this one alone for a
+  language server or a privileged helper.
+- [pty-nv](https://novo-lang.org/packages/pty-nv) is the pseudoterminal:
+  a shell with a terminal in front of it. A multiplexer's daemon takes
+  it for the panes and this package for the clients.
+- [termios-nv](https://novo-lang.org/packages/termios-nv) is the local
+  terminal's own settings, for the client end of the same program.
+- [smtp-nv](https://novo-lang.org/packages/smtp-nv) and
+  [ssh-nv](https://novo-lang.org/packages/ssh-nv) are the other host
+  packages that own a socket. Both speak a protocol over TCP; this one
+  speaks no protocol at all.
+
+## Tests
+
+```bash
+novo test tests/sock_tests.nv       # 7 tests: addresses, refusals, both socket types
+novo test tests/cred_tests.nv       # 6 tests: credentials, descriptors, activation
+novo test tests/mirror_tests.nv     # 6 tests: the primary, the mirrors, the size
 ```
 
-The suites are **red on purpose**: every body is a `todo()`, so every
-assertion reaches `not implemented: unixsock-nv.<module>.<fn>`.
-Nineteen tests across three suites, all red, every failure that message.
+The constants the suite asserts are the kernel's and the service
+manager's. 253 is Linux's `SCM_MAX_FD`, the most descriptors one
+`sendmsg` may carry; 108 is `sun_path`; `LISTEN_FDS`, `LISTEN_PID`,
+`LISTEN_FDNAMES` and the first descriptor number 3 are systemd's
+`sd_listen_fds` contract, which launchd and inetd match.
 
-## The layer, and why
+A connected socket needs two processes, so the suite asserts what the
+design put in a value rather than in an exchange: the three address
+forms, the `sun_path` bound, and every connecting entry point against a
+path nothing is listening on, which asserts the refusal. The tests
+compile today and fail at run, each on the
+`not implemented: unixsock-nv.<module>.<fn>` panic that is its body.
+They turn green one at a time as bodies land.
 
-`host`, from the plan.  Every row is one of `[net]`, `[net, time]`,
-`[net, io]` or `[io]`, and there is no `core` half to split out — a
-socket package with no socket in it is an empty package.  The handful of
-functions here that really are arithmetic (`addr_text`, `addr_fits`,
-`sun_path_limit`, `effective_size`, `fds_of`) declare `[]` inside the
-host modules, which the budget permits.
+## Implementation status
 
-`[io]` appears beside `[net]` in exactly three places, and each is a
-different thing:
-
-- **`unlink_stale`, `close_listener`, `unixdgram.close`** — removing the
-  filesystem entry a `bind` created is not a socket operation, and the
-  standard library's own `novo_unix_unlink` declares `[io]` for it.
-- **`unixactivate.activation` and `unset_environment`** — reading and
-  clearing `LISTEN_FDS`, `LISTEN_PID` and `LISTEN_FDNAMES` is an
-  environment access, which SPEC § 5.1 puts in `[io]`.
-- **`unixcred.peer_is_self`** — comparing the peer's uid against this
-  process's own asks a question about the process, not about the socket.
-
-## What moves out of `std.pty`, line by line
-
-The nine `novo_unix_*` externs are the whole of it.  Nothing else in
-`std.pty` is about sockets, and nothing here re-declares an extern — a
-duplicate `@ffi` wrapper emits the same LLVM symbol twice and fails IR
-verification, so this package sits over `std.net`'s `unix_listen` and
-`unix_connect` and over the runtime's own entry points, and `std.pty`
-keeps its declarations exactly as they are.
-
-| `std.pty` extern | becomes |
+| Item | Implemented |
 | --- | --- |
-| `novo_unix_listen(path)` | `unixsock.listen(UnixAddr, backlog)` |
-| `novo_unix_accept(listen_fd)` | `unixsock.accept(UnixListener)` — `None` rather than `-2` |
-| `novo_unix_connect(path)` | `unixsock.connect(UnixAddr)`, and `connect_deadline` for the launcher race |
-| `novo_unix_close(fd)` | `unixsock.close` / `close_listener`, the second unlinking what it bound |
-| `novo_unix_unlink(path)` | `unixsock.unlink_stale(UnixAddr)` — and it answers whether something IS listening |
-| `novo_unix_read_byte(fd)` | `unixsock.read_byte` — `None` for EAGAIN, `UnixHangup` for EOF |
-| `novo_unix_write_byte(fd, b)` | folded into `unixsock.write_all` |
-| `novo_unix_write_str(fd, s)` | `unixsock.write_str` |
-| `novo_unix_poll(fd, ms)` | `unixsock.poll` / `poll_listener`, answering `UnixReady` rather than a bitmask |
-
-And the mirror machinery, which is socket bookkeeping that ended up
-inside a pseudoterminal module because that is where the first caller
-was:
-
-| `std.pty` extern | becomes |
-| --- | --- |
-| `novo_pty_try_accept_mirror` | `unixmirror.accept_into` |
-| `novo_pty_mirror_count` | `unixmirror.client_count` |
-| `novo_pty_drain_mirror_input` | `unixmirror.drain_input`, one buffer per client |
-| `novo_pty_promote_if_detached` | `unixmirror.promote_if_detached` |
-| `novo_pty_set_primary_size` | `unixmirror.set_size` |
-| `novo_pty_force_detach` | `unixmirror.detach_primary` |
-| `novo_pty_set_headless` | `unixmirror.headless_set` |
-| `novo_pty_set_daemon_listen` | nothing: the listener is a value the caller holds |
-| `novo_pty_take_reattach_count` | `unixmirror.take_reattaches` |
-| `novo_pty_mirror_byte` | folded into `unixmirror.broadcast` |
-
-**What `std.pty` keeps**, and it is the majority of the module: the
-pseudoterminal itself.  `novo_pty_spawn_shell` and `novo_pty_close`,
-`novo_pty_read_byte` and `novo_pty_write_byte` on the master,
-`novo_pty_poll` and `novo_pty_poll_many`, the host TTY's raw mode
-(`set_raw_mode`, `restore_mode`, `stdin_is_tty`), the window size
-(`set_winsize`, `get_winsize`, `winsize_changed`), signalling and reaping
-(`kill_signal`, `child_exited`, `child_status`), `novo_pty_spawn_daemon`
-and `novo_pty_redirect_io`.  It is the runtime boundary for `forkpty` and
-belongs there; the two packages coexist rather than one wrapping the
-other.
-
-**And the eight `take_*` externs go to a third place.**
-`novo_pty_take_pending_resize`, `take_kill_request`,
-`take_capture_request`, `take_capture_index`, `take_lssession_request`,
-`take_status_request`, `take_reload_request` and `take_swsession_request`
-are not sockets and not pseudoterminals: they are the multiplexer's
-control protocol, and they are muxproto-nv's row.  This package carries
-the bytes; that one says what they mean.
-
-## What the kernel gives you for free, and where it is named
-
-| the fact | why it matters | where |
-| --- | --- | --- |
-| the peer's uid, recorded at `connect` | the one authentication a socket gives with no secret anywhere | `unixcred.peer_cred` |
-| the peer's pid, which is NOT an authorisation | the process may be gone and the number reused | the same field, and the module header says so |
-| a descriptor, duplicated into the receiver | a privileged helper can open what the receiver could not | `unixcred.send_with_rights` |
-| a listener bound before the process started | clients queue instead of being refused during a restart | `unixactivate.activation` |
-| `LISTEN_PID`, which is a check | the variables are inherited, so a helper adopts fd 3 without it | `activation()` answers `None` |
-| the abstract namespace | a socket no `rm` can break and no crash can leave stale | `unixsock.abstract_name` |
-
-## Five places a Unix socket bites, and each one has a name
-
-- **Closing a bound listener does not remove its path.**  The next
-  `bind` fails with EADDRINUSE against a socket nobody is listening on,
-  and every daemon that has shipped this bug unlinks first and hopes.
-  `UnixListener` carries the address so `close_listener` removes exactly
-  what it created, and `unlink_stale` is the deliberate form — it
-  answers a fault when something IS listening, which is the case a blind
-  `unlink` turns into two daemons, one of them unreachable.
-- **A path one byte too long binds a different socket.**  `sun_path` is
-  108 bytes and a longer path is TRUNCATED, not refused, so the server
-  reports that it is listening and the client gets "no such file".
-  `unixsock.addr_fits` and `UnixPathTooLong`.
-- **EAGAIN and EOF are the same `-1` in a naive wrapper.**  One says ask
-  again and the other says the peer is gone; a loop that conflates them
-  spins at a hundred per cent of a core or reports every idle moment as
-  a disconnect.  `read_byte` answers `None` for the first and
-  `UnixHangup` for the second, and `UnixReady` keeps `readable` and
-  `hangup` apart for the same reason.
-- **`SCM_RIGHTS` on an empty message is dropped by some kernels.**
-  Legal to write, and the descriptors intermittently never arrive.
-  `send_with_rights` refuses a zero-length payload at the call.
-- **A truncated datagram looks exactly like a short one.**  A receiver
-  cannot tell by comparing lengths, because a message that exactly
-  filled the buffer is indistinguishable.
-  `UnixDatagramMessage.truncated`.
-
-## What is deliberately absent
-
-- **`SOCK_SEQPACKET`.**  A third socket type, supported on Linux and not
-  on macOS, whose contract — message boundaries AND a connection — is
-  genuinely useful and has no portable story.  A row for it belongs in
-  the review rather than a half-portable surface here.
-- **`async`.**  Every call blocks its task, and every read is
-  non-blocking, so an event loop composes them already.  The row that
-  wants `[async]` is a server with a thousand connections per cell, and
-  the change is an effect row and a second set of entry points rather
-  than a redesign.
-- **Peer credentials on macOS.**  `LOCAL_PEERCRED` has a different
-  struct and no pid.  `UnixNoPeerCred` is the honest answer until
-  somebody needs it, because a server that read uid 0 out of a failed
-  call would authorise everybody.
-- **A connection pool, a framing layer, a request/response shape.**  All
-  three are protocols, and this is the transport.
-
-## Reference
-
-Rust's `std::os::unix::net` is the API this ports — `UnixStream`,
-`UnixListener`, `UnixDatagram`, `SocketAddr` with its abstract-namespace
-case, and `pair()`.  What it does not have and this does: `SO_PEERCRED`
-and `SCM_RIGHTS` (which Rust leaves to `nix` and `sendfd`), socket
-activation (`libsystemd`'s `sd_listen_fds`), and the mirror set, which is
-novomux's own shape.  `man 7 unix` is the normative document the module
-headers transcribe.
+| `unixsock.path`, `.abstract_name`, `.addr_text`, `.addr_fits`, `.sun_path_limit` | no |
+| `unixsock.connect`, `.connect_deadline`, `.listen`, `.accept`, `.accept_deadline`, `.socket_pair` | no |
+| `unixsock.read_byte`, `.read`, `.write_all`, `.write_str`, `.poll`, `.poll_listener`, `.shutdown` | no |
+| `unixsock.close`, `.close_listener`, `.unlink_stale` | no |
+| `unixsock.fd_of`, `.listener_fd_of`, `.stream_of_fd`, `.listener_of_fd` | no |
+| `unixsock.UnixFault.message` | no |
+| `unixdgram.open`, `.bind`, `.send_to`, `.recv_from`, `.recv_deadline` | no |
+| `unixdgram.max_message_bytes`, `.close`, `.fd_of` | no |
+| `unixcred.peer_cred`, `.peer_is_self`, `.set_pass_cred`, `.max_rights_per_message` | no |
+| `unixcred.send_with_rights`, `.receive_with_rights`, `.close_rights` | no |
+| `unixcred.UnixCredFault.message` | no |
+| `unixactivate.activation`, `.unset_environment`, `.fd_at`, `.fd_named`, `.listeners` | no |
+| `unixactivate.is_unix_listener`, `.is_unix_stream` | no |
+| `unixmirror.headless_set`, `.accept_into`, `.remove`, `.client_count`, `.fds_of`, `.primary_of` | no |
+| `unixmirror.broadcast`, `.drain_input`, `.set_size`, `.effective_size` | no |
+| `unixmirror.promote_if_detached`, `.detach_primary`, `.take_reattaches` | no |
 
 ## Licence
 
-Apache-2.0.
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
